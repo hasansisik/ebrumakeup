@@ -255,7 +255,7 @@
       ]
     }
   ],
-  "lastUpdated": "2026-10-13T22:03:37.812Z",
+  "lastUpdated": "2026-10-13T22:22:16.985Z",
   "analytics": {
     "baselineVisitors": 0,
     "baselinePageViews": 0,
@@ -263,7 +263,7 @@
       "v_8fnm0qk_mv76hma5",
       "v_qpg8544_mv76vxr6"
     ],
-    "pageViewsCount": 9,
+    "pageViewsCount": 14,
     "blogAnalytics": {
       "cilt-bakimi-rehberi": {
         "uniqueVisitors": [
@@ -288,10 +288,35 @@
           "v_8fnm0qk_mv76hma5",
           "v_qpg8544_mv76vxr6"
         ],
-        "pageViews": 9
+        "pageViews": 14
       }
     },
     "recentLogs": [
+      {
+        "visitorId": "76hma5",
+        "path": "/",
+        "timestamp": "01:22"
+      },
+      {
+        "visitorId": "76hma5",
+        "path": "/portfolio/mezuniyet-glow",
+        "timestamp": "01:21"
+      },
+      {
+        "visitorId": "76hma5",
+        "path": "/",
+        "timestamp": "01:16"
+      },
+      {
+        "visitorId": "76hma5",
+        "path": "/portfolio/gelin-makyaji",
+        "timestamp": "01:16"
+      },
+      {
+        "visitorId": "76hma5",
+        "path": "/",
+        "timestamp": "01:16"
+      },
       {
         "visitorId": "76hma5",
         "path": "/blog/2026-makyaj-trendleri",
