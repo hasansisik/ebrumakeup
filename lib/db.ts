@@ -1,20 +1,20 @@
 /**
  * Data layer.
  *
- * Production (Vercel): everything is stored in Upstash Redis, because the
- * serverless filesystem is read-only. Configure either
- *   UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN   (Upstash console)
- * or
- *   KV_REST_API_URL + KV_REST_API_TOKEN                 (Vercel Marketplace integration)
+ * Production (Vercel): everything is stored in MongoDB, because the serverless
+ * filesystem is read-only. Configure MONGODB_URI (and optionally MONGODB_DB,
+ * default "ebru").
  *
- * Local development without those variables falls back to data/ebru-db.json.
+ * Local development without MONGODB_URI falls back to data/ebru-db.json.
  *
- * On the first run against an empty Redis database, the content and analytics
- * in data/ebru-db.json are copied into Redis automatically.
+ * On the first run against an empty database, the content and analytics in
+ * data/ebru-db.json are copied into MongoDB automatically.
  */
 import fs from "fs";
 import path from "path";
+import { MongoClient, MongoServerError, type Db } from "mongodb";
 import { cacheTag, revalidatePath, revalidateTag } from "next/cache";
+import { connection } from "next/server";
 import seedJson from "@/data/ebru-db.json";
 import {
   BlogPost,
@@ -79,58 +79,88 @@ const seedDb = seedJson as unknown as DatabaseSchema;
 
 const CONTENT_TAG = "content";
 const DB_PATH = path.join(process.cwd(), "data", "ebru-db.json");
+const MAX_LOGS = 25;
+const DAY_TTL_SECONDS = 60 * 60 * 24 * 120;
 
 /* ============================================================
-   REDIS (Upstash REST API)
-   ============================================================ */
+   MONGODB
+   ============================================================
 
-const K = {
-  content: "ebru:content",
-  analyticsSeeded: "ebru:an:seeded",
-  visitors: "ebru:an:visitors",
-  pageViews: "ebru:an:pageviews",
-  logs: "ebru:an:logs",
-  dayVisitors: (day: string) => `ebru:an:day:${day}:visitors`,
-  dayViews: (day: string) => `ebru:an:day:${day}:views`,
-  blogVisitors: (id: string) => `ebru:an:blog:${id}:visitors`,
-  blogViews: (id: string) => `ebru:an:blog:${id}:views`,
-};
+   Collections:
+     content        { _id: "main", blogPosts, portfolioItems, heroColumns, lastUpdated }
+     counters       { _id: "pageviews" | "day:YYYY-MM-DD" | "blog:<id>", n }
+     visitors       { _id: visitorId }
+     day_visitors   { _id: "YYYY-MM-DD|visitorId", day, createdAt }   (TTL 120 days)
+     blog_visitors  { _id: "<blogId>|visitorId", blogId }
+     meta           { _id: "recentLogs", items: [...] }, { _id: "analyticsSeeded" }
+*/
 
-const DAY_TTL_SECONDS = 60 * 60 * 24 * 120;
-const MAX_LOGS = 25;
-
-function redisConfig(): { url: string; token: string } | null {
-  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return null;
-  return { url: url.replace(/\/+$/, ""), token };
+interface IdDoc {
+  _id: string;
+}
+interface ContentDoc extends ContentSchema, IdDoc {}
+interface CounterDoc extends IdDoc {
+  n: number;
+}
+interface DayVisitorDoc extends IdDoc {
+  day: string;
+  createdAt: Date;
+}
+interface BlogVisitorDoc extends IdDoc {
+  blogId: string;
+}
+interface MetaDoc extends IdDoc {
+  items?: LogEntry[];
+  at?: Date;
 }
 
-type RedisArg = string | number;
+const hasMongo = () => Boolean(process.env.MONGODB_URI);
 
-/** Runs commands in a single pipeline request and returns their results in order. */
-async function redis(commands: RedisArg[][]): Promise<unknown[]> {
-  const cfg = redisConfig();
-  if (!cfg) throw new Error("Redis is not configured.");
-  if (commands.length === 0) return [];
+const globalForMongo = globalThis as unknown as { __ebruMongoDb?: Promise<Db> };
 
-  const res = await fetch(`${cfg.url}/pipeline`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${cfg.token}` },
-    body: JSON.stringify(commands),
-    // Never let Next's fetch cache store database reads (it persists across builds).
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    throw new Error(`Redis request failed (${res.status}): ${await res.text()}`);
+function getDb(): Promise<Db> {
+  if (!globalForMongo.__ebruMongoDb) {
+    const client = new MongoClient(process.env.MONGODB_URI!, {
+      maxPoolSize: 5,
+      serverSelectionTimeoutMS: 10_000,
+    });
+    globalForMongo.__ebruMongoDb = client
+      .connect()
+      .then(async (c) => {
+        const db = c.db(process.env.MONGODB_DB || "ebru");
+        await Promise.all([
+          db.collection("day_visitors").createIndex({ day: 1 }),
+          db.collection("day_visitors").createIndex({ createdAt: 1 }, { expireAfterSeconds: DAY_TTL_SECONDS }),
+          db.collection("blog_visitors").createIndex({ blogId: 1 }),
+        ]);
+        return db;
+      })
+      .catch((err) => {
+        globalForMongo.__ebruMongoDb = undefined; // retry on next call
+        throw err;
+      });
   }
-  const data = (await res.json()) as { result?: unknown; error?: string }[];
-  const failed = data.find((d) => d.error);
-  if (failed) throw new Error(`Redis error: ${failed.error}`);
-  return data.map((d) => d.result);
+  return globalForMongo.__ebruMongoDb;
 }
 
-const toNumber = (v: unknown) => Number(v ?? 0) || 0;
+const isDuplicateKey = (err: unknown) => err instanceof MongoServerError && err.code === 11000;
+
+/** Insert-if-missing; concurrent duplicates are expected and ignored. */
+async function insertIgnoringDuplicates<T extends IdDoc>(
+  db: Db,
+  collection: string,
+  docs: T[]
+): Promise<void> {
+  if (docs.length === 0) return;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await db.collection<T>(collection).insertMany(docs as any, { ordered: false });
+  } catch (err) {
+    const writeErrors = (err as { writeErrors?: { code?: number }[] }).writeErrors;
+    const onlyDuplicates = writeErrors?.every((e) => e.code === 11000);
+    if (!isDuplicateKey(err) && !onlyDuplicates) throw err;
+  }
+}
 
 /* ============================================================
    LOCAL FILE FALLBACK (development only)
@@ -154,9 +184,7 @@ function readFileDb(): DatabaseSchema {
 
 function writeFileDb(data: DatabaseSchema): void {
   if (process.env.VERCEL) {
-    throw new Error(
-      "Veritabanı ayarlanmamış: Vercel'de UPSTASH_REDIS_REST_URL ve UPSTASH_REDIS_REST_TOKEN (veya KV_REST_API_URL ve KV_REST_API_TOKEN) ortam değişkenlerini ekleyin."
-    );
+    throw new Error("Veritabanı ayarlanmamış: Vercel'de MONGODB_URI ortam değişkenini ekleyin.");
   }
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   data.lastUpdated = new Date().toISOString();
@@ -167,7 +195,7 @@ function writeFileDb(data: DatabaseSchema): void {
    CONTENT STORAGE (blog, portfolio, hero)
    ============================================================ */
 
-function toContent(db: DatabaseSchema): ContentSchema {
+function toContent(db: Partial<DatabaseSchema>): ContentSchema {
   return {
     blogPosts: db.blogPosts ?? initialBlogPosts,
     portfolioItems: db.portfolioItems ?? initialPortfolioItems,
@@ -178,22 +206,26 @@ function toContent(db: DatabaseSchema): ContentSchema {
 
 /** Always reads fresh (uncached) content. Use for read-modify-write. */
 async function loadContent(): Promise<ContentSchema> {
-  if (!redisConfig()) return toContent(readFileDb());
+  if (!hasMongo()) return toContent(readFileDb());
 
-  const [raw] = await redis([["GET", K.content]]);
-  if (typeof raw === "string") return toContent(JSON.parse(raw));
+  const db = await getDb();
+  const contentCol = db.collection<ContentDoc>("content");
+  const doc = await contentCol.findOne({ _id: "main" }, { projection: { _id: 0 } });
+  if (doc) return toContent(doc);
 
   // Empty database: seed it with the bundled data (only the first writer wins).
-  const initial = toContent(seedDb);
-  await redis([["SET", K.content, JSON.stringify(initial), "NX"]]);
-  const [afterSeed] = await redis([["GET", K.content]]);
-  return typeof afterSeed === "string" ? toContent(JSON.parse(afterSeed)) : initial;
+  await insertIgnoringDuplicates<ContentDoc>(db, "content", [{ _id: "main", ...toContent(seedDb) }]);
+  const seeded = await contentCol.findOne({ _id: "main" }, { projection: { _id: 0 } });
+  return toContent(seeded ?? seedDb);
 }
 
 async function saveContent(content: ContentSchema): Promise<void> {
   content.lastUpdated = new Date().toISOString();
-  if (redisConfig()) {
-    await redis([["SET", K.content, JSON.stringify(content)]]);
+  if (hasMongo()) {
+    const db = await getDb();
+    await db
+      .collection<ContentDoc>("content")
+      .replaceOne({ _id: "main" }, content, { upsert: true });
   } else {
     const db = readFileDb();
     writeFileDb({ ...db, ...content });
@@ -282,7 +314,7 @@ export async function updateBlogPost(id: string, updates: Partial<BlogPost>): Pr
   if (index === -1) return null;
 
   const updated: BlogPost = { ...content.blogPosts[index], ...updates, id };
-  // View counts live in the analytics store, not on the post.
+  // View counts live in the analytics collections, not on the post.
   delete updated.views;
   delete updated.uniqueViews;
 
@@ -404,39 +436,64 @@ const todayKey = () => new Date().toISOString().slice(0, 10);
 
 let analyticsSeedChecked = false;
 
-/** Copies the analytics from data/ebru-db.json into an empty Redis database once. */
-async function ensureAnalyticsSeeded(): Promise<void> {
+/** Copies the analytics from data/ebru-db.json into an empty database once. */
+async function ensureAnalyticsSeeded(db: Db): Promise<void> {
   if (analyticsSeedChecked) return;
-  const [claimed] = await redis([["SET", K.analyticsSeeded, new Date().toISOString(), "NX"]]);
+  const meta = db.collection<MetaDoc>("meta");
+  try {
+    await meta.insertOne({ _id: "analyticsSeeded", at: new Date() });
+  } catch (err) {
+    if (!isDuplicateKey(err)) throw err;
+    analyticsSeedChecked = true;
+    return; // already seeded
+  }
   analyticsSeedChecked = true;
-  if (claimed !== "OK") return;
 
   const a = seedDb.analytics;
   if (!a) return;
-  const cmds: RedisArg[][] = [];
-  if (a.uniqueVisitors?.length) cmds.push(["SADD", K.visitors, ...a.uniqueVisitors]);
-  if (a.pageViewsCount) cmds.push(["INCRBY", K.pageViews, a.pageViewsCount]);
+  const counters: CounterDoc[] = [];
+
+  await insertIgnoringDuplicates(db, "visitors", (a.uniqueVisitors ?? []).map((v) => ({ _id: v })));
+  if (a.pageViewsCount) counters.push({ _id: "pageviews", n: a.pageViewsCount });
+
   for (const [day, d] of Object.entries(a.dailyVisits ?? {})) {
-    if (d.uniqueVisitors?.length) cmds.push(["SADD", K.dayVisitors(day), ...d.uniqueVisitors]);
-    if (d.pageViews) cmds.push(["INCRBY", K.dayViews(day), d.pageViews]);
-    cmds.push(["EXPIRE", K.dayVisitors(day), DAY_TTL_SECONDS], ["EXPIRE", K.dayViews(day), DAY_TTL_SECONDS]);
+    await insertIgnoringDuplicates<DayVisitorDoc>(
+      db,
+      "day_visitors",
+      (d.uniqueVisitors ?? []).map((v) => ({ _id: `${day}|${v}`, day, createdAt: new Date(`${day}T12:00:00Z`) }))
+    );
+    if (d.pageViews) counters.push({ _id: `day:${day}`, n: d.pageViews });
   }
   for (const [id, b] of Object.entries(a.blogAnalytics ?? {})) {
-    if (b.uniqueVisitors?.length) cmds.push(["SADD", K.blogVisitors(id), ...b.uniqueVisitors]);
-    if (b.viewsCount) cmds.push(["INCRBY", K.blogViews(id), b.viewsCount]);
+    await insertIgnoringDuplicates<BlogVisitorDoc>(
+      db,
+      "blog_visitors",
+      (b.uniqueVisitors ?? []).map((v) => ({ _id: `${id}|${v}`, blogId: id }))
+    );
+    if (b.viewsCount) counters.push({ _id: `blog:${id}`, n: b.viewsCount });
   }
+
+  const counterCol = db.collection<CounterDoc>("counters");
+  await Promise.all(
+    counters.map((c) => counterCol.updateOne({ _id: c._id }, { $inc: { n: c.n } }, { upsert: true }))
+  );
   if (a.recentLogs?.length) {
-    cmds.push(["RPUSH", K.logs, ...a.recentLogs.slice(0, MAX_LOGS).map((l) => JSON.stringify(l))]);
+    await meta.updateOne(
+      { _id: "recentLogs" },
+      { $push: { items: { $each: a.recentLogs.slice(0, MAX_LOGS), $slice: MAX_LOGS } } },
+      { upsert: true }
+    );
   }
-  await redis(cmds);
 }
 
 async function getBlogStats(
   ids: string[]
 ): Promise<Record<string, { uniqueViews: number; views: number }>> {
+  await connection(); // live stats: always read at request time
   const result: Record<string, { uniqueViews: number; views: number }> = {};
+  for (const id of ids) result[id] = { uniqueViews: 0, views: 0 };
 
-  if (!redisConfig()) {
+  if (!hasMongo()) {
     const a = readFileDb().analytics ?? emptyAnalytics();
     for (const id of ids) {
       const b = a.blogAnalytics?.[id];
@@ -445,11 +502,26 @@ async function getBlogStats(
     return result;
   }
 
-  await ensureAnalyticsSeeded();
-  const values = await redis(ids.flatMap((id) => [["SCARD", K.blogVisitors(id)], ["GET", K.blogViews(id)]]));
-  ids.forEach((id, i) => {
-    result[id] = { uniqueViews: toNumber(values[i * 2]), views: toNumber(values[i * 2 + 1]) };
-  });
+  const db = await getDb();
+  await ensureAnalyticsSeeded(db);
+  const [uniques, views] = await Promise.all([
+    db
+      .collection<BlogVisitorDoc>("blog_visitors")
+      .aggregate<{ _id: string; count: number }>([
+        { $match: { blogId: { $in: ids } } },
+        { $group: { _id: "$blogId", count: { $sum: 1 } } },
+      ])
+      .toArray(),
+    db
+      .collection<CounterDoc>("counters")
+      .find({ _id: { $in: ids.map((id) => `blog:${id}`) } })
+      .toArray(),
+  ]);
+  for (const u of uniques) if (result[u._id]) result[u._id].uniqueViews = u.count;
+  for (const v of views) {
+    const id = v._id.slice("blog:".length);
+    if (result[id]) result[id].views = v.n;
+  }
   return result;
 }
 
@@ -464,7 +536,7 @@ export async function getAnalyticsStats(): Promise<AnalyticsSummary> {
     return { id: post.id, title: post.title, uniqueViews: s.uniqueViews, totalViews: s.views };
   });
 
-  if (!redisConfig()) {
+  if (!hasMongo()) {
     const a = readFileDb().analytics ?? emptyAnalytics();
     return {
       totalUniqueVisitors: a.uniqueVisitors?.length || 0,
@@ -476,26 +548,21 @@ export async function getAnalyticsStats(): Promise<AnalyticsSummary> {
     };
   }
 
-  const [total, today, pageViews, logs] = await redis([
-    ["SCARD", K.visitors],
-    ["SCARD", K.dayVisitors(todayKey())],
-    ["GET", K.pageViews],
-    ["LRANGE", K.logs, 0, MAX_LOGS - 1],
+  const db = await getDb();
+  const [total, today, pageViews, logs] = await Promise.all([
+    db.collection("visitors").countDocuments(),
+    db.collection("day_visitors").countDocuments({ day: todayKey() }),
+    db.collection<CounterDoc>("counters").findOne({ _id: "pageviews" }),
+    db.collection<MetaDoc>("meta").findOne({ _id: "recentLogs" }),
   ]);
 
   return {
-    totalUniqueVisitors: toNumber(total),
-    todayUniqueVisitors: toNumber(today),
-    totalPageViews: toNumber(pageViews),
+    totalUniqueVisitors: total,
+    todayUniqueVisitors: today,
+    totalPageViews: pageViews?.n ?? 0,
     totalBlogReads,
     blogs,
-    recentLogs: ((logs as string[]) ?? []).flatMap((l) => {
-      try {
-        return [JSON.parse(l) as LogEntry];
-      } catch {
-        return [];
-      }
-    }),
+    recentLogs: logs?.items ?? [],
   };
 }
 
@@ -529,34 +596,43 @@ export async function recordVisit(params: {
   };
   const day = todayKey();
 
-  if (!redisConfig()) return recordVisitToFile(visitorId, blogId, log, day);
+  if (!hasMongo()) return recordVisitToFile(visitorId, blogId, log, day);
   if (!visitorId) return { totalUnique: 0 };
 
-  await ensureAnalyticsSeeded();
-  const cmds: RedisArg[][] = [
-    ["SADD", K.visitors, visitorId],
-    ["INCR", K.pageViews],
-    ["SADD", K.dayVisitors(day), visitorId],
-    ["EXPIRE", K.dayVisitors(day), DAY_TTL_SECONDS],
-    ["INCR", K.dayViews(day)],
-    ["EXPIRE", K.dayViews(day), DAY_TTL_SECONDS],
-    ["LPUSH", K.logs, JSON.stringify(log)],
-    ["LTRIM", K.logs, 0, MAX_LOGS - 1],
-    ["SCARD", K.visitors],
-  ];
-  if (blogId) {
-    cmds.push(
-      ["SADD", K.blogVisitors(blogId), visitorId],
-      ["INCR", K.blogViews(blogId)],
-      ["SCARD", K.blogVisitors(blogId)]
-    );
-  }
-  const results = await redis(cmds);
+  const db = await getDb();
+  await ensureAnalyticsSeeded(db);
+  const counters = db.collection<CounterDoc>("counters");
+  const inc = (id: string) => counters.updateOne({ _id: id }, { $inc: { n: 1 } }, { upsert: true });
 
-  return {
-    totalUnique: toNumber(results[8]),
-    blogUnique: blogId ? toNumber(results[11]) : undefined,
-  };
+  await Promise.all([
+    insertIgnoringDuplicates(db, "visitors", [{ _id: visitorId }]),
+    insertIgnoringDuplicates<DayVisitorDoc>(db, "day_visitors", [
+      { _id: `${day}|${visitorId}`, day, createdAt: new Date() },
+    ]),
+    inc("pageviews"),
+    inc(`day:${day}`),
+    db
+      .collection<MetaDoc>("meta")
+      .updateOne(
+        { _id: "recentLogs" },
+        { $push: { items: { $each: [log], $position: 0, $slice: MAX_LOGS } } },
+        { upsert: true }
+      ),
+    ...(blogId
+      ? [
+          insertIgnoringDuplicates<BlogVisitorDoc>(db, "blog_visitors", [
+            { _id: `${blogId}|${visitorId}`, blogId },
+          ]),
+          inc(`blog:${blogId}`),
+        ]
+      : []),
+  ]);
+
+  const [totalUnique, blogUnique] = await Promise.all([
+    db.collection("visitors").countDocuments(),
+    blogId ? db.collection("blog_visitors").countDocuments({ blogId }) : Promise.resolve(undefined),
+  ]);
+  return { totalUnique, blogUnique };
 }
 
 function recordVisitToFile(

@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.3.3",
+    "mongodb": "^7.8.0",
     "next": "16.4.0",
     "postcss": "^8.5.30",
     "react": "19.3.0",
