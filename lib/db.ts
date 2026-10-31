@@ -320,7 +320,9 @@ export async function updateBlogPost(id: string, updates: Partial<BlogPost>): Pr
 
   content.blogPosts[index] = updated;
   await saveContent(content);
-  return updated;
+  // Return with live counts so the admin list keeps showing them after an edit.
+  const stats = await getBlogStats([id]);
+  return { ...withDefaults(updated), ...stats[id] };
 }
 
 export async function deleteBlogPost(id: string): Promise<boolean> {
