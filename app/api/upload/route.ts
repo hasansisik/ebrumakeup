@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
-import fs from "fs";
-import path from "path";
+import crypto from "crypto";
 import { isAuthenticated } from "@/lib/auth";
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB (Cloudinary free plan limit)
+const UPLOAD_FOLDER = "ebru-makeup";
 
 export async function POST(request: Request) {
   try {
@@ -13,43 +15,71 @@ export async function POST(request: Request) {
       );
     }
 
-    const formData = await request.formData();
-    const file = formData.get("file") as File | null;
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+    const apiKey = process.env.CLOUDINARY_API_KEY;
+    const apiSecret = process.env.CLOUDINARY_API_SECRET;
+    if (!cloudName || !apiKey || !apiSecret) {
+      console.error("Upload error: Cloudinary environment variables are missing.");
+      return NextResponse.json(
+        { success: false, message: "Görsel depolama ayarları eksik." },
+        { status: 500 }
+      );
+    }
 
-    if (!file) {
+    const formData = await request.formData();
+    const file = formData.get("file");
+
+    if (!(file instanceof File)) {
       return NextResponse.json(
         { success: false, message: "Dosya bulunamadı." },
         { status: 400 }
       );
     }
-
-    const bytes = await file.arrayBuffer();
-    const buffer = Buffer.from(bytes);
-
-    // Ensure uploads directory exists
-    const uploadsDir = path.join(process.cwd(), "public", "uploads");
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
+    if (!file.type.startsWith("image/")) {
+      return NextResponse.json(
+        { success: false, message: "Sadece görsel dosyaları yüklenebilir." },
+        { status: 400 }
+      );
+    }
+    if (file.size > MAX_FILE_SIZE) {
+      return NextResponse.json(
+        { success: false, message: "Görsel en fazla 10 MB olabilir." },
+        { status: 400 }
+      );
     }
 
-    // Clean filename and make unique
-    const ext = path.extname(file.name) || ".jpg";
-    const baseName = path
-      .basename(file.name, ext)
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "-")
-      .slice(0, 30);
-    const uniqueFileName = `${Date.now()}-${baseName}${ext}`;
-    const filePath = path.join(uploadsDir, uniqueFileName);
+    // Signed upload: signature = sha1 of sorted params + api secret
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signature = crypto
+      .createHash("sha1")
+      .update(`folder=${UPLOAD_FOLDER}&timestamp=${timestamp}${apiSecret}`)
+      .digest("hex");
 
-    fs.writeFileSync(filePath, buffer);
+    const uploadForm = new FormData();
+    uploadForm.append("file", file);
+    uploadForm.append("api_key", apiKey);
+    uploadForm.append("timestamp", timestamp);
+    uploadForm.append("folder", UPLOAD_FOLDER);
+    uploadForm.append("signature", signature);
 
-    const publicUrl = `/uploads/${uniqueFileName}`;
+    const res = await fetch(
+      `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`,
+      { method: "POST", body: uploadForm }
+    );
+    const data = await res.json();
+
+    if (!res.ok || !data.secure_url) {
+      console.error("Cloudinary upload error:", data?.error?.message || data);
+      return NextResponse.json(
+        { success: false, message: "Görsel yüklenirken bir hata oluştu." },
+        { status: 502 }
+      );
+    }
 
     return NextResponse.json({
       success: true,
-      url: publicUrl,
-      fileName: uniqueFileName,
+      url: data.secure_url as string,
+      fileName: data.public_id as string,
     });
   } catch (error) {
     console.error("Upload error:", error);
