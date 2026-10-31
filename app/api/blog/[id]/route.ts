@@ -28,6 +28,7 @@ export async function PUT(
 
     return NextResponse.json({ success: true, post: updated });
   } catch (error) {
+    console.error("API error:", error);
     return NextResponse.json(
       { success: false, message: "Güncelleme sırasında hata oluştu." },
       { status: 500 }
@@ -63,6 +64,7 @@ export async function DELETE(
       message: "Blog yazısı başarıyla silindi.",
     });
   } catch (error) {
+    console.error("API error:", error);
     return NextResponse.json(
       { success: false, message: "Silme sırasında hata oluştu." },
       { status: 500 }

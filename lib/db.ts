@@ -1,5 +1,21 @@
+/**
+ * Data layer.
+ *
+ * Production (Vercel): everything is stored in Upstash Redis, because the
+ * serverless filesystem is read-only. Configure either
+ *   UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN   (Upstash console)
+ * or
+ *   KV_REST_API_URL + KV_REST_API_TOKEN                 (Vercel Marketplace integration)
+ *
+ * Local development without those variables falls back to data/ebru-db.json.
+ *
+ * On the first run against an empty Redis database, the content and analytics
+ * in data/ebru-db.json are copied into Redis automatically.
+ */
 import fs from "fs";
 import path from "path";
+import { cacheTag, revalidatePath, revalidateTag } from "next/cache";
+import seedJson from "@/data/ebru-db.json";
 import {
   BlogPost,
   PortfolioItem,
@@ -42,140 +58,207 @@ export interface DatabaseSchema {
   lastUpdated: string;
 }
 
-const defaultAnalytics: AnalyticsSchema = {
+interface ContentSchema {
+  blogPosts: BlogPost[];
+  portfolioItems: PortfolioItem[];
+  heroColumns: HeroColumn[];
+  lastUpdated: string;
+}
+
+const emptyAnalytics = (): AnalyticsSchema => ({
   baselineVisitors: 0,
   baselinePageViews: 0,
   uniqueVisitors: [],
   pageViewsCount: 0,
-  blogAnalytics: {
-    "cilt-bakimi-rehberi": {
-      uniqueVisitors: [],
-      viewsCount: 0,
-    },
-    "2026-makyaj-trendleri": {
-      uniqueVisitors: [],
-      viewsCount: 0,
-    },
-    "gelin-makyaji-ipuclari": {
-      uniqueVisitors: [],
-      viewsCount: 0,
-    },
-  },
+  blogAnalytics: {},
   dailyVisits: {},
   recentLogs: [],
-};
+});
 
+const seedDb = seedJson as unknown as DatabaseSchema;
+
+const CONTENT_TAG = "content";
 const DB_PATH = path.join(process.cwd(), "data", "ebru-db.json");
 
-// In-memory cache for fast read operations
-let cachedDb: DatabaseSchema | null = null;
+/* ============================================================
+   REDIS (Upstash REST API)
+   ============================================================ */
 
-function ensureDataDirectory() {
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+const K = {
+  content: "ebru:content",
+  analyticsSeeded: "ebru:an:seeded",
+  visitors: "ebru:an:visitors",
+  pageViews: "ebru:an:pageviews",
+  logs: "ebru:an:logs",
+  dayVisitors: (day: string) => `ebru:an:day:${day}:visitors`,
+  dayViews: (day: string) => `ebru:an:day:${day}:views`,
+  blogVisitors: (id: string) => `ebru:an:blog:${id}:visitors`,
+  blogViews: (id: string) => `ebru:an:blog:${id}:views`,
+};
+
+const DAY_TTL_SECONDS = 60 * 60 * 24 * 120;
+const MAX_LOGS = 25;
+
+function redisConfig(): { url: string; token: string } | null {
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return null;
+  return { url: url.replace(/\/+$/, ""), token };
 }
 
-export function readDb(): DatabaseSchema {
-  ensureDataDirectory();
+type RedisArg = string | number;
 
-  if (!fs.existsSync(DB_PATH)) {
-    // Seed initial data
-    const initialData: DatabaseSchema = {
-      blogPosts: initialBlogPosts,
-      portfolioItems: initialPortfolioItems,
-      heroColumns: initialHeroColumns,
-      analytics: defaultAnalytics,
-      lastUpdated: new Date().toISOString(),
-    };
-    fs.writeFileSync(DB_PATH, JSON.stringify(initialData, null, 2), "utf-8");
-    cachedDb = initialData;
-    return initialData;
+/** Runs commands in a single pipeline request and returns their results in order. */
+async function redis(commands: RedisArg[][]): Promise<unknown[]> {
+  const cfg = redisConfig();
+  if (!cfg) throw new Error("Redis is not configured.");
+  if (commands.length === 0) return [];
+
+  const res = await fetch(`${cfg.url}/pipeline`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.token}` },
+    body: JSON.stringify(commands),
+    // Never let Next's fetch cache store database reads (it persists across builds).
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`Redis request failed (${res.status}): ${await res.text()}`);
   }
+  const data = (await res.json()) as { result?: unknown; error?: string }[];
+  const failed = data.find((d) => d.error);
+  if (failed) throw new Error(`Redis error: ${failed.error}`);
+  return data.map((d) => d.result);
+}
 
+const toNumber = (v: unknown) => Number(v ?? 0) || 0;
+
+/* ============================================================
+   LOCAL FILE FALLBACK (development only)
+   ============================================================ */
+
+function readFileDb(): DatabaseSchema {
   try {
-    const raw = fs.readFileSync(DB_PATH, "utf-8");
-    const data = JSON.parse(raw) as DatabaseSchema;
-    if (!data.analytics) {
-      data.analytics = defaultAnalytics;
-    }
-    if (!data.heroColumns || data.heroColumns.length === 0) {
-      data.heroColumns = initialHeroColumns;
-    }
-    cachedDb = data;
+    const data = JSON.parse(fs.readFileSync(DB_PATH, "utf-8")) as DatabaseSchema;
+    data.analytics ??= emptyAnalytics();
     return data;
-  } catch (error) {
-    console.error("Error reading database file, using fallback:", error);
-    if (cachedDb) return cachedDb;
+  } catch {
     return {
       blogPosts: initialBlogPosts,
       portfolioItems: initialPortfolioItems,
       heroColumns: initialHeroColumns,
-      analytics: defaultAnalytics,
+      analytics: emptyAnalytics(),
       lastUpdated: new Date().toISOString(),
     };
   }
 }
 
-export function writeDb(data: DatabaseSchema): void {
-  ensureDataDirectory();
-  data.lastUpdated = new Date().toISOString();
-  try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf-8");
-    cachedDb = data;
-  } catch (error) {
-    console.error("Error writing to database:", error);
-    throw error;
+function writeFileDb(data: DatabaseSchema): void {
+  if (process.env.VERCEL) {
+    throw new Error(
+      "Veritabanı ayarlanmamış: Vercel'de UPSTASH_REDIS_REST_URL ve UPSTASH_REDIS_REST_TOKEN (veya KV_REST_API_URL ve KV_REST_API_TOKEN) ortam değişkenlerini ekleyin."
+    );
   }
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  data.lastUpdated = new Date().toISOString();
+  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf-8");
+}
+
+/* ============================================================
+   CONTENT STORAGE (blog, portfolio, hero)
+   ============================================================ */
+
+function toContent(db: DatabaseSchema): ContentSchema {
+  return {
+    blogPosts: db.blogPosts ?? initialBlogPosts,
+    portfolioItems: db.portfolioItems ?? initialPortfolioItems,
+    heroColumns: db.heroColumns?.length ? db.heroColumns : initialHeroColumns,
+    lastUpdated: db.lastUpdated ?? new Date().toISOString(),
+  };
+}
+
+/** Always reads fresh (uncached) content. Use for read-modify-write. */
+async function loadContent(): Promise<ContentSchema> {
+  if (!redisConfig()) return toContent(readFileDb());
+
+  const [raw] = await redis([["GET", K.content]]);
+  if (typeof raw === "string") return toContent(JSON.parse(raw));
+
+  // Empty database: seed it with the bundled data (only the first writer wins).
+  const initial = toContent(seedDb);
+  await redis([["SET", K.content, JSON.stringify(initial), "NX"]]);
+  const [afterSeed] = await redis([["GET", K.content]]);
+  return typeof afterSeed === "string" ? toContent(JSON.parse(afterSeed)) : initial;
+}
+
+async function saveContent(content: ContentSchema): Promise<void> {
+  content.lastUpdated = new Date().toISOString();
+  if (redisConfig()) {
+    await redis([["SET", K.content, JSON.stringify(content)]]);
+  } else {
+    const db = readFileDb();
+    writeFileDb({ ...db, ...content });
+  }
+  // Pages show the change on the very next request.
+  revalidateTag(CONTENT_TAG, { expire: 0 });
+  revalidatePath("/", "layout");
+}
+
+/** Cached read for public pages; invalidated by saveContent(). */
+async function getCachedContent(): Promise<ContentSchema> {
+  "use cache";
+  cacheTag(CONTENT_TAG);
+  return loadContent();
+}
+
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/ğ/g, "g")
+    .replace(/ü/g, "u")
+    .replace(/ş/g, "s")
+    .replace(/ı/g, "i")
+    .replace(/ö/g, "o")
+    .replace(/ç/g, "c")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 /* ============================================================
    BLOG CRUD
    ============================================================ */
 
-function enrichPostWithStats(post: BlogPost, analytics?: AnalyticsSchema): BlogPost {
-  const blogId = post.id;
-  const blogData = analytics?.blogAnalytics?.[blogId];
-  const uniqueCount = blogData?.uniqueVisitors?.length ?? post.uniqueViews ?? 0;
-  const totalViews = blogData?.viewsCount ?? post.views ?? 0;
-
-  return {
-    ...post,
-    authorAvatar: post.authorAvatar || "/ebru.png",
-    uniqueViews: uniqueCount,
-    views: totalViews,
-  };
+function withDefaults(post: BlogPost): BlogPost {
+  return { ...post, authorAvatar: post.authorAvatar || "/ebru.png" };
 }
 
 export async function getBlogPosts(): Promise<BlogPost[]> {
-  const db = readDb();
-  return db.blogPosts.map((p) => enrichPostWithStats(p, db.analytics));
+  const content = await getCachedContent();
+  return content.blogPosts.map(withDefaults);
 }
 
 export async function getBlogPostById(id: string): Promise<BlogPost | null> {
-  const db = readDb();
-  const post = db.blogPosts.find((p) => p.id === id);
+  const content = await getCachedContent();
+  const post = content.blogPosts.find((p) => p.id === id);
+  return post ? withDefaults(post) : null;
+}
+
+/** Blog posts including live view counts (admin panel). */
+export async function getBlogPostsWithStats(): Promise<BlogPost[]> {
+  const posts = await getBlogPosts();
+  const stats = await getBlogStats(posts.map((p) => p.id));
+  return posts.map((p) => ({ ...p, ...stats[p.id] }));
+}
+
+export async function getBlogPostByIdWithStats(id: string): Promise<BlogPost | null> {
+  const post = await getBlogPostById(id);
   if (!post) return null;
-  return enrichPostWithStats(post, db.analytics);
+  const stats = await getBlogStats([post.id]);
+  return { ...post, ...stats[post.id] };
 }
 
 export async function createBlogPost(post: Omit<BlogPost, "id"> & { id?: string }): Promise<BlogPost> {
-  const db = readDb();
-
-  // Generate slug/id if not provided
-  const slug =
-    post.id?.trim() ||
-    post.title
-      .toLowerCase()
-      .replace(/ğ/g, "g")
-      .replace(/ü/g, "u")
-      .replace(/ş/g, "s")
-      .replace(/ı/g, "i")
-      .replace(/ö/g, "o")
-      .replace(/ç/g, "c")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "");
+  const content = await loadContent();
+  const slug = post.id?.trim() || slugify(post.title);
 
   const newPost: BlogPost = {
     ...post,
@@ -185,38 +268,36 @@ export async function createBlogPost(post: Omit<BlogPost, "id"> & { id?: string 
     authorTitle: post.authorTitle || "Profesyonel Makyaj Sanatçısı",
     authorAvatar: post.authorAvatar || "/logo.png",
   };
+  delete newPost.views;
+  delete newPost.uniqueViews;
 
-  // Remove existing with same id if any, prepend new post
-  db.blogPosts = [newPost, ...db.blogPosts.filter((p) => p.id !== slug)];
-  writeDb(db);
+  content.blogPosts = [newPost, ...content.blogPosts.filter((p) => p.id !== slug)];
+  await saveContent(content);
   return newPost;
 }
 
 export async function updateBlogPost(id: string, updates: Partial<BlogPost>): Promise<BlogPost | null> {
-  const db = readDb();
-  const index = db.blogPosts.findIndex((p) => p.id === id);
+  const content = await loadContent();
+  const index = content.blogPosts.findIndex((p) => p.id === id);
   if (index === -1) return null;
 
-  const updated: BlogPost = {
-    ...db.blogPosts[index],
-    ...updates,
-    id, // Keep ID unchanged
-  };
+  const updated: BlogPost = { ...content.blogPosts[index], ...updates, id };
+  // View counts live in the analytics store, not on the post.
+  delete updated.views;
+  delete updated.uniqueViews;
 
-  db.blogPosts[index] = updated;
-  writeDb(db);
+  content.blogPosts[index] = updated;
+  await saveContent(content);
   return updated;
 }
 
 export async function deleteBlogPost(id: string): Promise<boolean> {
-  const db = readDb();
-  const beforeCount = db.blogPosts.length;
-  db.blogPosts = db.blogPosts.filter((p) => p.id !== id);
-  if (db.blogPosts.length !== beforeCount) {
-    writeDb(db);
-    return true;
-  }
-  return false;
+  const content = await loadContent();
+  const before = content.blogPosts.length;
+  content.blogPosts = content.blogPosts.filter((p) => p.id !== id);
+  if (content.blogPosts.length === before) return false;
+  await saveContent(content);
+  return true;
 }
 
 /* ============================================================
@@ -224,32 +305,20 @@ export async function deleteBlogPost(id: string): Promise<boolean> {
    ============================================================ */
 
 export async function getPortfolioItems(): Promise<PortfolioItem[]> {
-  const db = readDb();
-  return db.portfolioItems;
+  const content = await getCachedContent();
+  return content.portfolioItems;
 }
 
 export async function getPortfolioItemById(id: string): Promise<PortfolioItem | null> {
-  const db = readDb();
-  return db.portfolioItems.find((p) => p.id === id) || null;
+  const content = await getCachedContent();
+  return content.portfolioItems.find((p) => p.id === id) || null;
 }
 
 export async function createPortfolioItem(
   item: Omit<PortfolioItem, "id"> & { id?: string }
 ): Promise<PortfolioItem> {
-  const db = readDb();
-
-  const slug =
-    item.id?.trim() ||
-    item.title
-      .toLowerCase()
-      .replace(/ğ/g, "g")
-      .replace(/ü/g, "u")
-      .replace(/ş/g, "s")
-      .replace(/ı/g, "i")
-      .replace(/ö/g, "o")
-      .replace(/ç/g, "c")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "");
+  const content = await loadContent();
+  const slug = item.id?.trim() || slugify(item.title);
 
   const newItem: PortfolioItem = {
     ...item,
@@ -263,8 +332,8 @@ export async function createPortfolioItem(
     },
   };
 
-  db.portfolioItems = [...db.portfolioItems.filter((p) => p.id !== slug), newItem];
-  writeDb(db);
+  content.portfolioItems = [...content.portfolioItems.filter((p) => p.id !== slug), newItem];
+  await saveContent(content);
   return newItem;
 }
 
@@ -272,30 +341,39 @@ export async function updatePortfolioItem(
   id: string,
   updates: Partial<PortfolioItem>
 ): Promise<PortfolioItem | null> {
-  const db = readDb();
-  const index = db.portfolioItems.findIndex((p) => p.id === id);
+  const content = await loadContent();
+  const index = content.portfolioItems.findIndex((p) => p.id === id);
   if (index === -1) return null;
 
-  const updated: PortfolioItem = {
-    ...db.portfolioItems[index],
-    ...updates,
-    id,
-  };
-
-  db.portfolioItems[index] = updated;
-  writeDb(db);
+  const updated: PortfolioItem = { ...content.portfolioItems[index], ...updates, id };
+  content.portfolioItems[index] = updated;
+  await saveContent(content);
   return updated;
 }
 
 export async function deletePortfolioItem(id: string): Promise<boolean> {
-  const db = readDb();
-  const beforeCount = db.portfolioItems.length;
-  db.portfolioItems = db.portfolioItems.filter((p) => p.id !== id);
-  if (db.portfolioItems.length !== beforeCount) {
-    writeDb(db);
-    return true;
-  }
-  return false;
+  const content = await loadContent();
+  const before = content.portfolioItems.length;
+  content.portfolioItems = content.portfolioItems.filter((p) => p.id !== id);
+  if (content.portfolioItems.length === before) return false;
+  await saveContent(content);
+  return true;
+}
+
+/* ============================================================
+   HERO / HEADER STAGE DYNAMIC MANAGEMENT
+   ============================================================ */
+
+export async function getHeroColumns(): Promise<HeroColumn[]> {
+  const content = await getCachedContent();
+  return content.heroColumns.length ? content.heroColumns : initialHeroColumns;
+}
+
+export async function updateHeroColumns(columns: HeroColumn[]): Promise<HeroColumn[]> {
+  const content = await loadContent();
+  content.heroColumns = columns;
+  await saveContent(content);
+  return columns;
 }
 
 /* ============================================================
@@ -320,38 +398,104 @@ export interface AnalyticsSummary {
   }[];
 }
 
+type LogEntry = AnalyticsSummary["recentLogs"][number];
+
+const todayKey = () => new Date().toISOString().slice(0, 10);
+
+let analyticsSeedChecked = false;
+
+/** Copies the analytics from data/ebru-db.json into an empty Redis database once. */
+async function ensureAnalyticsSeeded(): Promise<void> {
+  if (analyticsSeedChecked) return;
+  const [claimed] = await redis([["SET", K.analyticsSeeded, new Date().toISOString(), "NX"]]);
+  analyticsSeedChecked = true;
+  if (claimed !== "OK") return;
+
+  const a = seedDb.analytics;
+  if (!a) return;
+  const cmds: RedisArg[][] = [];
+  if (a.uniqueVisitors?.length) cmds.push(["SADD", K.visitors, ...a.uniqueVisitors]);
+  if (a.pageViewsCount) cmds.push(["INCRBY", K.pageViews, a.pageViewsCount]);
+  for (const [day, d] of Object.entries(a.dailyVisits ?? {})) {
+    if (d.uniqueVisitors?.length) cmds.push(["SADD", K.dayVisitors(day), ...d.uniqueVisitors]);
+    if (d.pageViews) cmds.push(["INCRBY", K.dayViews(day), d.pageViews]);
+    cmds.push(["EXPIRE", K.dayVisitors(day), DAY_TTL_SECONDS], ["EXPIRE", K.dayViews(day), DAY_TTL_SECONDS]);
+  }
+  for (const [id, b] of Object.entries(a.blogAnalytics ?? {})) {
+    if (b.uniqueVisitors?.length) cmds.push(["SADD", K.blogVisitors(id), ...b.uniqueVisitors]);
+    if (b.viewsCount) cmds.push(["INCRBY", K.blogViews(id), b.viewsCount]);
+  }
+  if (a.recentLogs?.length) {
+    cmds.push(["RPUSH", K.logs, ...a.recentLogs.slice(0, MAX_LOGS).map((l) => JSON.stringify(l))]);
+  }
+  await redis(cmds);
+}
+
+async function getBlogStats(
+  ids: string[]
+): Promise<Record<string, { uniqueViews: number; views: number }>> {
+  const result: Record<string, { uniqueViews: number; views: number }> = {};
+
+  if (!redisConfig()) {
+    const a = readFileDb().analytics ?? emptyAnalytics();
+    for (const id of ids) {
+      const b = a.blogAnalytics?.[id];
+      result[id] = { uniqueViews: b?.uniqueVisitors?.length ?? 0, views: b?.viewsCount ?? 0 };
+    }
+    return result;
+  }
+
+  await ensureAnalyticsSeeded();
+  const values = await redis(ids.flatMap((id) => [["SCARD", K.blogVisitors(id)], ["GET", K.blogViews(id)]]));
+  ids.forEach((id, i) => {
+    result[id] = { uniqueViews: toNumber(values[i * 2]), views: toNumber(values[i * 2 + 1]) };
+  });
+  return result;
+}
+
 export async function getAnalyticsStats(): Promise<AnalyticsSummary> {
-  const db = readDb();
-  const analytics = db.analytics || defaultAnalytics;
-
-  const todayKey = new Date().toISOString().slice(0, 10);
-  const todayUnique =
-    analytics.dailyVisits?.[todayKey]?.uniqueVisitors?.length || 0;
-
-  const totalUnique = analytics.uniqueVisitors?.length || 0;
-  const totalPageViews = analytics.pageViewsCount || 0;
+  const posts = await getBlogPosts();
+  const stats = await getBlogStats(posts.map((p) => p.id));
 
   let totalBlogReads = 0;
-  const blogs = db.blogPosts.map((post) => {
-    const blogData = analytics.blogAnalytics?.[post.id];
-    const unique = blogData?.uniqueVisitors?.length ?? post.uniqueViews ?? 0;
-    const views = blogData?.viewsCount ?? post.views ?? 0;
-    totalBlogReads += unique;
-    return {
-      id: post.id,
-      title: post.title,
-      uniqueViews: unique,
-      totalViews: views,
-    };
+  const blogs = posts.map((post) => {
+    const s = stats[post.id];
+    totalBlogReads += s.uniqueViews;
+    return { id: post.id, title: post.title, uniqueViews: s.uniqueViews, totalViews: s.views };
   });
 
+  if (!redisConfig()) {
+    const a = readFileDb().analytics ?? emptyAnalytics();
+    return {
+      totalUniqueVisitors: a.uniqueVisitors?.length || 0,
+      todayUniqueVisitors: a.dailyVisits?.[todayKey()]?.uniqueVisitors?.length || 0,
+      totalPageViews: a.pageViewsCount || 0,
+      totalBlogReads,
+      blogs,
+      recentLogs: a.recentLogs || [],
+    };
+  }
+
+  const [total, today, pageViews, logs] = await redis([
+    ["SCARD", K.visitors],
+    ["SCARD", K.dayVisitors(todayKey())],
+    ["GET", K.pageViews],
+    ["LRANGE", K.logs, 0, MAX_LOGS - 1],
+  ]);
+
   return {
-    totalUniqueVisitors: totalUnique,
-    todayUniqueVisitors: todayUnique,
-    totalPageViews: totalPageViews,
-    totalBlogReads: totalBlogReads,
+    totalUniqueVisitors: toNumber(total),
+    todayUniqueVisitors: toNumber(today),
+    totalPageViews: toNumber(pageViews),
+    totalBlogReads,
     blogs,
-    recentLogs: analytics.recentLogs || [],
+    recentLogs: ((logs as string[]) ?? []).flatMap((l) => {
+      try {
+        return [JSON.parse(l) as LogEntry];
+      } catch {
+        return [];
+      }
+    }),
   };
 }
 
@@ -360,99 +504,89 @@ export async function recordVisit(params: {
   path: string;
   blogId?: string;
 }): Promise<{ totalUnique: number; blogUnique?: number }> {
-  const db = readDb();
-  if (!db.analytics) {
-    db.analytics = defaultAnalytics;
-  }
-  const analytics = db.analytics;
-
-  const { visitorId, path, blogId } = params;
-  if (!visitorId) {
-    return {
-      totalUnique: analytics.uniqueVisitors?.length || 0,
-    };
-  }
-
-  // 1. Check & record unique visitor
-  if (!analytics.uniqueVisitors) analytics.uniqueVisitors = [];
-  if (!analytics.uniqueVisitors.includes(visitorId)) {
-    analytics.uniqueVisitors.push(visitorId);
-  }
-
-  // 2. Increment total page views
-  analytics.pageViewsCount = (analytics.pageViewsCount || 0) + 1;
-
-  // 3. Record daily stats
-  const todayKey = new Date().toISOString().slice(0, 10);
-  if (!analytics.dailyVisits) analytics.dailyVisits = {};
-  if (!analytics.dailyVisits[todayKey]) {
-    analytics.dailyVisits[todayKey] = { uniqueVisitors: [], pageViews: 0 };
-  }
-  if (!analytics.dailyVisits[todayKey].uniqueVisitors.includes(visitorId)) {
-    analytics.dailyVisits[todayKey].uniqueVisitors.push(visitorId);
-  }
-  analytics.dailyVisits[todayKey].pageViews += 1;
-
-  // 4. Record blog analytics if blogId
-  let blogUniqueCount: number | undefined;
+  // Inputs come from a public endpoint: normalise and bound them.
+  const visitorId = String(params.visitorId ?? "").slice(0, 64);
+  const pagePath = String(params.path || "/").slice(0, 200);
+  let blogId = params.blogId ? String(params.blogId).slice(0, 200) : undefined;
   if (blogId) {
-    if (!analytics.blogAnalytics) analytics.blogAnalytics = {};
-    if (!analytics.blogAnalytics[blogId]) {
-      analytics.blogAnalytics[blogId] = {
-        uniqueVisitors: [],
-        viewsCount: 0,
-      };
+    try {
+      blogId = decodeURIComponent(blogId);
+    } catch {
+      /* keep raw */
     }
-    const blogData = analytics.blogAnalytics[blogId];
-    if (!blogData.uniqueVisitors.includes(visitorId)) {
-      blogData.uniqueVisitors.push(visitorId);
-    }
-    blogData.viewsCount = (blogData.viewsCount || 0) + 1;
-
-    blogUniqueCount = blogData.uniqueVisitors.length;
-
-    // Sync to post object in db
-    const postIdx = db.blogPosts.findIndex((p) => p.id === blogId);
-    if (postIdx !== -1) {
-      db.blogPosts[postIdx].uniqueViews = blogUniqueCount;
-      db.blogPosts[postIdx].views = blogData.viewsCount;
-    }
+    const posts = await getBlogPosts();
+    if (!posts.some((p) => p.id === blogId)) blogId = undefined;
   }
 
-  // 5. Recent logs (keep last 25)
-  if (!analytics.recentLogs) analytics.recentLogs = [];
-  analytics.recentLogs.unshift({
+  const log: LogEntry = {
     visitorId: visitorId.slice(-6),
-    path: path || "/",
-    timestamp: new Date().toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" }),
-  });
-  if (analytics.recentLogs.length > 25) {
-    analytics.recentLogs = analytics.recentLogs.slice(0, 25);
-  }
+    path: pagePath,
+    timestamp: new Date().toLocaleTimeString("tr-TR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZone: "Europe/Istanbul",
+    }),
+  };
+  const day = todayKey();
 
-  writeDb(db);
+  if (!redisConfig()) return recordVisitToFile(visitorId, blogId, log, day);
+  if (!visitorId) return { totalUnique: 0 };
+
+  await ensureAnalyticsSeeded();
+  const cmds: RedisArg[][] = [
+    ["SADD", K.visitors, visitorId],
+    ["INCR", K.pageViews],
+    ["SADD", K.dayVisitors(day), visitorId],
+    ["EXPIRE", K.dayVisitors(day), DAY_TTL_SECONDS],
+    ["INCR", K.dayViews(day)],
+    ["EXPIRE", K.dayViews(day), DAY_TTL_SECONDS],
+    ["LPUSH", K.logs, JSON.stringify(log)],
+    ["LTRIM", K.logs, 0, MAX_LOGS - 1],
+    ["SCARD", K.visitors],
+  ];
+  if (blogId) {
+    cmds.push(
+      ["SADD", K.blogVisitors(blogId), visitorId],
+      ["INCR", K.blogViews(blogId)],
+      ["SCARD", K.blogVisitors(blogId)]
+    );
+  }
+  const results = await redis(cmds);
 
   return {
-    totalUnique: analytics.uniqueVisitors.length,
-    blogUnique: blogUniqueCount,
+    totalUnique: toNumber(results[8]),
+    blogUnique: blogId ? toNumber(results[11]) : undefined,
   };
 }
 
-/* ============================================================
-   HERO / HEADER STAGE DYNAMIC MANAGEMENT
-   ============================================================ */
+function recordVisitToFile(
+  visitorId: string,
+  blogId: string | undefined,
+  log: LogEntry,
+  day: string
+): { totalUnique: number; blogUnique?: number } {
+  const db = readFileDb();
+  const a = (db.analytics ??= emptyAnalytics());
+  if (!visitorId) return { totalUnique: a.uniqueVisitors.length };
 
-export async function getHeroColumns(): Promise<HeroColumn[]> {
-  const db = readDb();
-  if (!db.heroColumns || db.heroColumns.length === 0) {
-    return initialHeroColumns;
+  if (!a.uniqueVisitors.includes(visitorId)) a.uniqueVisitors.push(visitorId);
+  a.pageViewsCount = (a.pageViewsCount || 0) + 1;
+
+  a.dailyVisits ??= {};
+  const d = (a.dailyVisits[day] ??= { uniqueVisitors: [], pageViews: 0 });
+  if (!d.uniqueVisitors.includes(visitorId)) d.uniqueVisitors.push(visitorId);
+  d.pageViews += 1;
+
+  let blogUnique: number | undefined;
+  if (blogId) {
+    a.blogAnalytics ??= {};
+    const b = (a.blogAnalytics[blogId] ??= { uniqueVisitors: [], viewsCount: 0 });
+    if (!b.uniqueVisitors.includes(visitorId)) b.uniqueVisitors.push(visitorId);
+    b.viewsCount = (b.viewsCount || 0) + 1;
+    blogUnique = b.uniqueVisitors.length;
   }
-  return db.heroColumns;
-}
 
-export async function updateHeroColumns(columns: HeroColumn[]): Promise<HeroColumn[]> {
-  const db = readDb();
-  db.heroColumns = columns;
-  writeDb(db);
-  return columns;
+  a.recentLogs = [log, ...(a.recentLogs ?? [])].slice(0, MAX_LOGS);
+  writeFileDb(db);
+  return { totalUnique: a.uniqueVisitors.length, blogUnique };
 }

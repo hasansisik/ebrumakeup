@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { Metadata } from "next";
 import { isAuthenticated } from "@/lib/auth";
-import { getBlogPostById } from "@/lib/db";
+import { getBlogPostByIdWithStats } from "@/lib/db";
 import BlogEditorClient from "@/components/admin/BlogEditorClient";
 
 export const metadata: Metadata = {
@@ -26,7 +26,7 @@ export default async function AdminBlogEditPage({
 
   let post = null;
   if (!isNew) {
-    post = await getBlogPostById(id);
+    post = await getBlogPostByIdWithStats(id);
   }
 
   return (

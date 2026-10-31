@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import { Metadata } from "next";
 import { isAuthenticated } from "@/lib/auth";
 import {
-  getBlogPosts,
+  getBlogPostsWithStats,
   getPortfolioItems,
   getAnalyticsStats,
   getHeroColumns,
@@ -24,7 +24,7 @@ export default async function DashboardPage() {
   }
 
   const [posts, portfolio, stats, heroColumns] = await Promise.all([
-    getBlogPosts(),
+    getBlogPostsWithStats(),
     getPortfolioItems(),
     getAnalyticsStats(),
     getHeroColumns(),
